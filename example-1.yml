@@ -1,0 +1,7 @@
+port: 8081
+interval: 5
+health: /
+backends:
+  - url: https://github.com
+  - url: https://github.com
+  - url: https://github.com

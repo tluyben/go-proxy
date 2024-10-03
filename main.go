@@ -37,6 +37,7 @@ var (
 	configFile string
 	dnsCache   = make(map[string]string)
 	dnsMu      sync.RWMutex
+	verbose    bool
 )
 
 const (
@@ -46,18 +47,26 @@ const (
 
 func init() {
 	flag.StringVar(&configFile, "config", "backend.yml", "Path to the backend configuration file")
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
 	rand.Seed(time.Now().UnixNano())
 }
 
 func main() {
 	flag.Parse()
 
+	// Set up logging
+	if !verbose {
+		log.SetOutput(ioutil.Discard)
+	}
+
 	err := loadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	log.Printf("Loaded configuration: %+v", config)
+	if verbose {
+		log.Printf("Loaded configuration: %+v", config)
+	}
 
 	go healthCheck()
 
@@ -141,7 +150,9 @@ func healthCheck() {
 				client := http.Client{Timeout: httpTimeout}
 				resp, err := client.Get(healthURL)
 				if err != nil {
-					log.Printf("Health check failed for %s: %v", healthURL, err)
+					if verbose {
+						log.Printf("Health check failed for %s: %v", healthURL, err)
+					}
 					atomic.StoreInt32(&config.Backends[i].Health, 0)
 					return
 				}
@@ -149,8 +160,14 @@ func healthCheck() {
 
 				if resp.StatusCode == http.StatusOK {
 					atomic.StoreInt32(&config.Backends[i].Health, 1)
+					if verbose {
+						log.Printf("Backend %s is healthy", backend.URL)
+					}
 				} else {
 					atomic.StoreInt32(&config.Backends[i].Health, 0)
+					if verbose {
+						log.Printf("Backend %s is unhealthy, status code: %d", backend.URL, resp.StatusCode)
+					}
 				}
 			}(i, backend)
 		}
@@ -175,25 +192,33 @@ func getHealthyBackend() (*Backend, error) {
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	log.Printf("Received request for %s", r.URL.Path)
+	if verbose {
+		log.Printf("Received request for %s", r.URL.Path)
+	}
 
 	backend, err := getHealthyBackend()
 	if err != nil {
-		log.Printf("No healthy backends available: %v", err)
+		if verbose {
+			log.Printf("No healthy backends available: %v", err)
+		}
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
 	backendURL, err := url.Parse(backend.URL)
 	if err != nil {
-		log.Printf("Failed to parse backend URL: %v", err)
+		if verbose {
+			log.Printf("Failed to parse backend URL: %v", err)
+		}
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("Proxy error: %v", err)
+		if verbose {
+			log.Printf("Proxy error: %v", err)
+		}
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 
@@ -207,8 +232,12 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	log.Printf("Proxying request to %s", backend.URL)
+	if verbose {
+		log.Printf("Proxying request to %s", backend.URL)
+	}
 	proxy.ServeHTTP(w, r)
 
-	log.Printf("Request completed in %v", time.Since(startTime))
+	if verbose {
+		log.Printf("Request completed in %v", time.Since(startTime))
+	}
 }

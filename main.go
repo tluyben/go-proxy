@@ -12,32 +12,28 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v2"
 )
 
 type Backend struct {
-	URL      string `yaml:"url"`
-	Up       bool
-	Last     time.Time
-	Host     string
-	Port     string
-	IPAddr   string
-	FailTime time.Time
+	URL    string `yaml:"url"`
+	Host   string
+	Port   string
+	Health int32 // 0 for down, 1 for up
 }
 
 type Config struct {
-	Port           int       `yaml:"port"`
-	Interval       int       `yaml:"interval"`
-	Health         string    `yaml:"health"`
-	Backends       []Backend `yaml:"backends"`
-	HealthyBackends []int
+	Port     int       `yaml:"port"`
+	Interval int       `yaml:"interval"`
+	Health   string    `yaml:"health"`
+	Backends []Backend `yaml:"backends"`
 }
 
 var (
 	config     Config
-	mu         sync.RWMutex
 	configFile string
 	dnsCache   = make(map[string]string)
 	dnsMu      sync.RWMutex
@@ -45,8 +41,7 @@ var (
 
 const (
 	dnsTimeout    = 500 * time.Millisecond
-	failureWindow = 30 * time.Second
-	httpTimeout   = 10 * time.Second
+	httpTimeout   = 5 * time.Second
 )
 
 func init() {
@@ -119,7 +114,6 @@ func resolveHostWithTimeout(host string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dnsTimeout)
 	defer cancel()
 
-	log.Printf("Resolving host: %s", host)
 	resolver := &net.Resolver{}
 	ips, err := resolver.LookupIP(ctx, "ip4", host)
 	if err != nil {
@@ -136,97 +130,84 @@ func resolveHostWithTimeout(host string) (string, error) {
 	dnsCache[host] = ip
 	dnsMu.Unlock()
 
-	log.Printf("Resolved %s to %s", host, ip)
 	return ip, nil
 }
 
 func healthCheck() {
 	for {
-		log.Println("Starting health check cycle")
-		mu.Lock()
-		config.HealthyBackends = []int{}
 		for i, backend := range config.Backends {
-			if time.Since(backend.FailTime) < failureWindow {
-				log.Printf("Skipping %s due to recent failure", backend.Host)
-				continue
-			}
-
-			log.Printf("Checking backend %s", backend.Host)
-			ip, err := resolveHostWithTimeout(backend.Host)
-			if err != nil {
-				log.Printf("DNS lookup failed for %s: %v", backend.Host, err)
-				config.Backends[i].Up = false
-				config.Backends[i].FailTime = time.Now()
-				continue
-			}
-			config.Backends[i].IPAddr = ip
-
-			healthURL := fmt.Sprintf("%s%s", backend.URL, config.Health)
-			log.Printf("Performing health check on %s", healthURL)
-			client := http.Client{Timeout: httpTimeout}
-			resp, err := client.Get(healthURL)
-			if err != nil {
-				log.Printf("Health check failed for %s: %v", healthURL, err)
-				config.Backends[i].Up = false
-				config.Backends[i].FailTime = time.Now()
-			} else {
-				config.Backends[i].Up = resp.StatusCode == http.StatusOK
-				if config.Backends[i].Up {
-					log.Printf("Backend %s is healthy", backend.Host)
-					config.HealthyBackends = append(config.HealthyBackends, i)
-					config.Backends[i].Last = time.Now()
-				} else {
-					log.Printf("Backend %s is unhealthy, status code: %d", backend.Host, resp.StatusCode)
+			go func(i int, backend Backend) {
+				healthURL := fmt.Sprintf("%s%s", backend.URL, config.Health)
+				client := http.Client{Timeout: httpTimeout}
+				resp, err := client.Get(healthURL)
+				if err != nil {
+					log.Printf("Health check failed for %s: %v", healthURL, err)
+					atomic.StoreInt32(&config.Backends[i].Health, 0)
+					return
 				}
-				resp.Body.Close()
-			}
-		}
-		log.Printf("Health check cycle completed. Healthy backends: %v", config.HealthyBackends)
-		mu.Unlock()
+				defer resp.Body.Close()
 
+				if resp.StatusCode == http.StatusOK {
+					atomic.StoreInt32(&config.Backends[i].Health, 1)
+				} else {
+					atomic.StoreInt32(&config.Backends[i].Health, 0)
+				}
+			}(i, backend)
+		}
 		time.Sleep(time.Duration(config.Interval) * time.Second)
 	}
+}
+
+func getHealthyBackend() (*Backend, error) {
+	healthyBackends := make([]*Backend, 0)
+	for i := range config.Backends {
+		if atomic.LoadInt32(&config.Backends[i].Health) == 1 {
+			healthyBackends = append(healthyBackends, &config.Backends[i])
+		}
+	}
+
+	if len(healthyBackends) == 0 {
+		return nil, fmt.Errorf("no healthy backends available")
+	}
+
+	return healthyBackends[rand.Intn(len(healthyBackends))], nil
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	log.Printf("Received request for %s", r.URL.Path)
 
-	mu.RLock()
-	defer mu.RUnlock()
-
-	if len(config.HealthyBackends) == 0 {
-		log.Printf("No healthy backends available, returning 502 Bad Gateway")
-		http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
+	backend, err := getHealthyBackend()
+	if err != nil {
+		log.Printf("No healthy backends available: %v", err)
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	backendIndex := config.HealthyBackends[rand.Intn(len(config.HealthyBackends))]
-	backend := config.Backends[backendIndex]
-
-	log.Printf("Selected backend %s (%s:%s)", backend.Host, backend.IPAddr, backend.Port)
-
-	director := func(req *http.Request) {
-		req.URL.Scheme = "http"
-		req.URL.Host = fmt.Sprintf("%s:%s", backend.IPAddr, backend.Port)
-		req.Host = backend.Host
-		log.Printf("Directing request to %s (%s)", req.Host, req.URL.Host)
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		log.Printf("Failed to parse backend URL: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
 
-	proxy := &httputil.ReverseProxy{
-		Director: director,
-		Transport: &http.Transport{
-			Dial: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).Dial,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
+	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("Proxy error: %v", err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 
-	log.Printf("Proxying request to %s (%s:%s)", backend.Host, backend.IPAddr, backend.Port)
+	proxy.Transport = &http.Transport{
+		Dial: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).Dial,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	log.Printf("Proxying request to %s", backend.URL)
 	proxy.ServeHTTP(w, r)
 
 	log.Printf("Request completed in %v", time.Since(startTime))

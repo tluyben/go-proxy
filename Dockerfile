@@ -1,11 +1,12 @@
 # Start from debian:bullseye-slim
 FROM debian:bullseye-slim
 
-# Install necessary tools
+# Install necessary tools including make
 RUN apt-get update && apt-get install -y \
     git \
     golang \
     ca-certificates \
+    make \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -14,8 +15,8 @@ WORKDIR /app
 # Clone the repository
 RUN git clone https://github.com/tluyben/go-proxy.git .
 
-# Build the application
-RUN go build -o proxy-server
+# Build the application using make
+RUN make build
 
 # Copy the backend.yml file
 COPY backend.yml /backend.yml
@@ -25,3 +26,4 @@ EXPOSE 80
 
 # Run the proxy server
 CMD ["./proxy-server", "--config", "/backend.yml"]
+

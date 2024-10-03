@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"gopkg.in/yaml.v2"
 )
 
@@ -38,6 +40,7 @@ var (
 	dnsCache   = make(map[string]string)
 	dnsMu      sync.RWMutex
 	verbose    bool
+	sentryDSN  string
 )
 
 const (
@@ -49,6 +52,7 @@ func init() {
 	flag.StringVar(&configFile, "config", "backend.yml", "Path to the backend configuration file")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
 	rand.Seed(time.Now().UnixNano())
+	sentryDSN = os.Getenv("SENTRY_DSN")
 }
 
 func main() {
@@ -68,11 +72,40 @@ func main() {
 		log.Printf("Loaded configuration: %+v", config)
 	}
 
+	// Initialize Sentry if DSN is provided
+	if sentryDSN != "" {
+		err := sentry.Init(sentry.ClientOptions{
+			Dsn: sentryDSN,
+		})
+		if err != nil {
+			log.Fatalf("Sentry initialization failed: %v", err)
+		}
+		defer sentry.Flush(2 * time.Second)
+	}
+
 	go healthCheck()
 
 	http.HandleFunc("/", proxyHandler)
 	log.Printf("Starting proxy server on port %d", config.Port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), nil))
+}
+
+func logFatal(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	log.Print(msg)
+	if sentryDSN != "" {
+		sentry.CaptureException(fmt.Errorf(msg))
+		sentry.Flush(time.Second * 5)
+	}
+	os.Exit(1)
+}
+
+func logCritical(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	log.Print(msg)
+	if sentryDSN != "" {
+		sentry.CaptureMessage(msg)
+	}
 }
 
 func loadConfig() error {
@@ -184,6 +217,7 @@ func getHealthyBackend() (*Backend, error) {
 	}
 
 	if len(healthyBackends) == 0 {
+		logCritical("No healthy backends available")
 		return nil, fmt.Errorf("no healthy backends available")
 	}
 
@@ -201,6 +235,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		if verbose {
 			log.Printf("No healthy backends available: %v", err)
 		}
+		logCritical("Failed to parse backend URL: %v", err)
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -210,6 +245,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		if verbose {
 			log.Printf("Failed to parse backend URL: %v", err)
 		}
+		logCritical("Failed to parse backend URL: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -219,6 +255,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		if verbose {
 			log.Printf("Proxy error: %v", err)
 		}
+		logCritical("Proxy error: %v", err)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 

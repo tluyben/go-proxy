@@ -1,10 +1,9 @@
 # Start from debian:bullseye-slim
-FROM debian:bullseye-slim
+FROM golang:1.20-bullseye
 
 # Install necessary tools including make
 RUN apt-get update && apt-get install -y \
     git \
-    golang \
     ca-certificates \
     make \
     && rm -rf /var/lib/apt/lists/*

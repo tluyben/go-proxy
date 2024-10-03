@@ -17,9 +17,12 @@ import (
 )
 
 type Backend struct {
-	URL  string `yaml:"url"`
-	Up   bool
-	Last time.Time
+	URL      string `yaml:"url"`
+	Up       bool
+	Last     time.Time
+	Host     string
+	IPAddr   string
+	FailTime time.Time
 }
 
 type Config struct {
@@ -34,6 +37,13 @@ var (
 	config     Config
 	mu         sync.RWMutex
 	configFile string
+	dnsCache   = make(map[string]string)
+	dnsMu      sync.RWMutex
+)
+
+const (
+	dnsTimeout    = 5 * time.Second
+	failureWindow = 30 * time.Second
 )
 
 func init() {
@@ -79,7 +89,36 @@ func loadConfig() error {
 		config.Health = "/health"
 	}
 
+	for i, backend := range config.Backends {
+		parsedURL, err := url.Parse(backend.URL)
+		if err != nil {
+			log.Printf("Failed to parse backend URL %s: %v", backend.URL, err)
+			continue
+		}
+		config.Backends[i].Host = parsedURL.Hostname()
+	}
+
 	return nil
+}
+
+func resolveHost(host string) (string, error) {
+	dnsMu.RLock()
+	if ip, ok := dnsCache[host]; ok {
+		dnsMu.RUnlock()
+		return ip, nil
+	}
+	dnsMu.RUnlock()
+
+	ip, err := net.ResolveIPAddr("ip", host)
+	if err != nil {
+		return "", err
+	}
+
+	dnsMu.Lock()
+	dnsCache[host] = ip.String()
+	dnsMu.Unlock()
+
+	return ip.String(), nil
 }
 
 func healthCheck() {
@@ -87,25 +126,26 @@ func healthCheck() {
 		mu.Lock()
 		config.HealthyBackends = []int{}
 		for i, backend := range config.Backends {
-			backendURL, err := url.Parse(backend.URL)
-			if err != nil {
-				log.Printf("Failed to parse backend URL %s: %v", backend.URL, err)
-				config.Backends[i].Up = false
+			if time.Since(backend.FailTime) < failureWindow {
 				continue
 			}
 
-			_, err = net.LookupHost(backendURL.Hostname())
+			ip, err := resolveHost(backend.Host)
 			if err != nil {
-				log.Printf("DNS lookup failed for %s: %v", backendURL.Hostname(), err)
+				log.Printf("DNS lookup failed for %s: %v", backend.Host, err)
 				config.Backends[i].Up = false
+				config.Backends[i].FailTime = time.Now()
 				continue
 			}
+			config.Backends[i].IPAddr = ip
 
-			healthURL := backend.URL + config.Health
-			resp, err := http.Get(healthURL)
+			healthURL := fmt.Sprintf("http://%s%s", ip, config.Health)
+			client := http.Client{Timeout: dnsTimeout}
+			resp, err := client.Get(healthURL)
 			if err != nil {
 				log.Printf("Health check failed for %s: %v", healthURL, err)
 				config.Backends[i].Up = false
+				config.Backends[i].FailTime = time.Now()
 			} else {
 				config.Backends[i].Up = resp.StatusCode == http.StatusOK
 				if config.Backends[i].Up {
@@ -134,14 +174,13 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	backendIndex := config.HealthyBackends[rand.Intn(len(config.HealthyBackends))]
 	backend := config.Backends[backendIndex]
 
-	backendURL, err := url.Parse(backend.URL)
-	if err != nil {
-		log.Printf("Failed to parse backend URL %s: %v", backend.URL, err)
-		http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
-		return
+	director := func(req *http.Request) {
+		req.URL.Scheme = "http"
+		req.URL.Host = backend.IPAddr
+		req.Host = backend.Host
 	}
 
-	log.Printf("Proxying request to %s", backend.URL)
-	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+	proxy := &httputil.ReverseProxy{Director: director}
+	log.Printf("Proxying request to %s (%s)", backend.Host, backend.IPAddr)
 	proxy.ServeHTTP(w, r)
 }

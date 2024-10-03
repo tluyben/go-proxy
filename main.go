@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -21,6 +22,7 @@ type Backend struct {
 	Up       bool
 	Last     time.Time
 	Host     string
+	Port     string
 	IPAddr   string
 	FailTime time.Time
 }
@@ -42,7 +44,7 @@ var (
 )
 
 const (
-	dnsTimeout    = 5 * time.Second
+	dnsTimeout    = 500 * time.Millisecond
 	failureWindow = 30 * time.Second
 	httpTimeout   = 10 * time.Second
 )
@@ -97,12 +99,16 @@ func loadConfig() error {
 			continue
 		}
 		config.Backends[i].Host = parsedURL.Hostname()
+		config.Backends[i].Port = parsedURL.Port()
+		if config.Backends[i].Port == "" {
+			config.Backends[i].Port = "80"
+		}
 	}
 
 	return nil
 }
 
-func resolveHost(host string) (string, error) {
+func resolveHostWithTimeout(host string) (string, error) {
 	dnsMu.RLock()
 	if ip, ok := dnsCache[host]; ok {
 		dnsMu.RUnlock()
@@ -110,18 +116,28 @@ func resolveHost(host string) (string, error) {
 	}
 	dnsMu.RUnlock()
 
+	ctx, cancel := context.WithTimeout(context.Background(), dnsTimeout)
+	defer cancel()
+
 	log.Printf("Resolving host: %s", host)
-	ip, err := net.ResolveIPAddr("ip", host)
+	resolver := &net.Resolver{}
+	ips, err := resolver.LookupIP(ctx, "ip4", host)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve %s: %v", host, err)
 	}
 
+	if len(ips) == 0 {
+		return "", fmt.Errorf("no IPs found for %s", host)
+	}
+
+	ip := ips[0].String()
+
 	dnsMu.Lock()
-	dnsCache[host] = ip.String()
+	dnsCache[host] = ip
 	dnsMu.Unlock()
 
-	log.Printf("Resolved %s to %s", host, ip.String())
-	return ip.String(), nil
+	log.Printf("Resolved %s to %s", host, ip)
+	return ip, nil
 }
 
 func healthCheck() {
@@ -136,7 +152,7 @@ func healthCheck() {
 			}
 
 			log.Printf("Checking backend %s", backend.Host)
-			ip, err := resolveHost(backend.Host)
+			ip, err := resolveHostWithTimeout(backend.Host)
 			if err != nil {
 				log.Printf("DNS lookup failed for %s: %v", backend.Host, err)
 				config.Backends[i].Up = false
@@ -145,7 +161,7 @@ func healthCheck() {
 			}
 			config.Backends[i].IPAddr = ip
 
-			healthURL := fmt.Sprintf("http://%s%s", ip, config.Health)
+			healthURL := fmt.Sprintf("%s%s", backend.URL, config.Health)
 			log.Printf("Performing health check on %s", healthURL)
 			client := http.Client{Timeout: httpTimeout}
 			resp, err := client.Get(healthURL)
@@ -188,11 +204,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	backendIndex := config.HealthyBackends[rand.Intn(len(config.HealthyBackends))]
 	backend := config.Backends[backendIndex]
 
-	log.Printf("Selected backend %s (%s)", backend.Host, backend.IPAddr)
+	log.Printf("Selected backend %s (%s:%s)", backend.Host, backend.IPAddr, backend.Port)
 
 	director := func(req *http.Request) {
 		req.URL.Scheme = "http"
-		req.URL.Host = backend.IPAddr
+		req.URL.Host = fmt.Sprintf("%s:%s", backend.IPAddr, backend.Port)
 		req.Host = backend.Host
 		log.Printf("Directing request to %s (%s)", req.Host, req.URL.Host)
 	}
@@ -210,7 +226,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	log.Printf("Proxying request to %s (%s)", backend.Host, backend.IPAddr)
+	log.Printf("Proxying request to %s (%s:%s)", backend.Host, backend.IPAddr, backend.Port)
 	proxy.ServeHTTP(w, r)
 
 	log.Printf("Request completed in %v", time.Since(startTime))

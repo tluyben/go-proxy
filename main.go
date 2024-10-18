@@ -28,10 +28,17 @@ type Backend struct {
 }
 
 type Config struct {
-	Port     int       `yaml:"port"`
-	Interval int       `yaml:"interval"`
-	Health   string    `yaml:"health"`
-	Backends []Backend `yaml:"backends"`
+	Port     				int       `yaml:"port"`
+	Interval 				int       `yaml:"interval"`
+	Health   				string    `yaml:"health"`
+	Backends 				[]Backend `yaml:"backends"`
+
+	DialTimeout 			time.Duration `yaml:"dial_timeout"`
+	DialKeepAlive   		time.Duration `yaml:"keep_alive"`
+	TLSHandshakeTimeout		time.Duration `yaml:"tls_handshake_timeout"`
+	ResponseHeaderTimeout 	time.Duration `yaml:"response_header_timeout"`
+	ExpectContinueTimeout 	time.Duration `yaml:"expect_continue_timeout"`
+
 }
 
 var (
@@ -259,14 +266,39 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 
+	timeout := time.Duration(5) 
+	if (config.DialTimeout != 0) {
+		timeout = config.DialTimeout
+	}
+
+	keepalive := time.Duration(30)
+	if (config.DialKeepAlive != 0) {
+		keepalive = config.DialKeepAlive
+	}
+
+	tlsHandshakeTimeout := time.Duration(5)
+	if (config.TLSHandshakeTimeout != 0) {
+		tlsHandshakeTimeout = config.TLSHandshakeTimeout
+	}
+
+	responseHeaderTimeout := time.Duration(5)
+	if (config.ResponseHeaderTimeout != 0) {
+		responseHeaderTimeout = config.ResponseHeaderTimeout
+	}
+
+	expectContinueTimeout := time.Duration(1)
+	if (config.ExpectContinueTimeout != 0) {
+		expectContinueTimeout = config.ExpectContinueTimeout
+	}
+
 	proxy.Transport = &http.Transport{
 		Dial: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   timeout * time.Second,
+			KeepAlive: keepalive * time.Second,
 		}).Dial,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout * time.Second,
+		ExpectContinueTimeout: expectContinueTimeout * time.Second,
 	}
 
 	if verbose {

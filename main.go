@@ -31,6 +31,7 @@ type Config struct {
 	Port     				int       `yaml:"port"`
 	Interval 				int       `yaml:"interval"`
 	Health   				string    `yaml:"health"`
+	BearerToken   			string `yaml:"bearer_token,omitempty"`
 	Backends 				[]Backend `yaml:"backends"`
 
 	DialTimeout 			time.Duration `yaml:"dial_timeout"`
@@ -188,7 +189,26 @@ func healthCheck() {
 			go func(i int, backend Backend) {
 				healthURL := fmt.Sprintf("%s%s", backend.URL, config.Health)
 				client := http.Client{Timeout: httpTimeout}
-				resp, err := client.Get(healthURL)
+				
+				// Create a new request to add headers
+				req, err := http.NewRequest("GET", healthURL, nil)
+				if err != nil {
+					if verbose {
+						log.Printf("Failed to create health check request for %s: %v", healthURL, err)
+					}
+					atomic.StoreInt32(&config.Backends[i].Health, 0)
+					return
+				}
+
+				// Add bearer token if present
+				if config.BearerToken != "" {
+					req.Header.Set("Authorization", "Bearer "+config.BearerToken)
+					if verbose {
+						log.Printf("Added bearer token to health check request")
+					}
+				}
+
+				resp, err := client.Do(req)
 				if err != nil {
 					if verbose {
 						log.Printf("Health check failed for %s: %v", healthURL, err)
@@ -258,6 +278,19 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+	
+	// Modify the director to add bearer token if present
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		if config.BearerToken != "" {
+			req.Header.Set("Authorization", "Bearer "+config.BearerToken)
+			if verbose {
+				log.Printf("Added bearer token to request")
+			}
+		}
+	}
+
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		if verbose {
 			log.Printf("Proxy error: %v", err)

@@ -9,6 +9,7 @@ This is a simple HTTP proxy server written in Go. It reads backend configuration
 - Regular health checks on backend servers
 - Load balancing across healthy backends
 - Fallback to other backends if one becomes unhealthy
+- Optional bearer token authentication for backend requests
 - Returns a 502 Bad Gateway error if all backends are down
 
 ## Requirements
@@ -24,6 +25,7 @@ The proxy server is configured using a YAML file. By default, it looks for a fil
 port: 8080
 interval: 5
 health: /health
+bearer_token: your-token-here  # Optional: Add this if your backends require authentication
 backends:
   - url: http://backend1.example.com
   - url: http://backend2.example.com
@@ -33,7 +35,17 @@ backends:
 - `port`: The port on which the proxy server will listen (default: 80)
 - `interval`: The interval in seconds between health checks (default: 3)
 - `health`: The health check endpoint to use for all backends (default: /health)
+- `bearer_token`: Optional authentication token for backend requests. When provided, it will be added as a bearer token in the Authorization header for all requests to backends (including health checks)
 - `backends`: A list of backend servers to proxy requests to
+
+### Authentication
+
+If your backend services require authentication, you can provide a bearer token in the configuration. When configured, the proxy will:
+- Add the bearer token to all proxied requests to the backends
+- Include the token in health check requests
+- Use the format: `Authorization: Bearer your-token-here`
+
+This is particularly useful when your backends are protected by authentication but you want to keep the proxy transparent to clients.
 
 ## Building and Running
 

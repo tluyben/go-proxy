@@ -34,4 +34,19 @@ build-linux:
 docker-build:
 	docker build -t $(BINARY_NAME):latest .
 
-.PHONY: all build test clean run deps build-linux docker-build
+linux-amd64:
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BINARY_NAME)-linux-amd64 -v
+
+deploy-s3: linux-amd64
+	@echo "Starting deploy to S3..."
+	@which rclone || (echo "rclone not found" && exit 1)
+	@echo "Rclone found, proceeding with upload..."
+	bash -c 'set -ex; \
+		source .env; \
+		rclone --s3-provider Other \
+		--s3-endpoint=$$S3_ENDPOINT \
+		--s3-access-key-id=$$S3_ACCESS_KEY \
+		--s3-secret-access-key=$$S3_SECRET_KEY \
+		moveto ./$(BINARY_NAME)-linux-amd64 :s3:binaries/$(BINARY_NAME)'
+
+.PHONY: all build test clean run deps build-linux docker-build linux-amd64 deploy-s3
